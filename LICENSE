@@ -1,21 +1,29 @@
-MIT License
+Copyright (c) 2026 Omar El Quammah
+Nanjing University of Information Science & Technology
 
-Copyright (c) 2026 OMARELQUAMMAH
+RESEARCH PREVIEW LICENSE
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
+This software and associated documentation are provided solely 
+for academic peer review and reproducibility verification of the 
+manuscript "CausalPipe-Transfer: Streaming Domain Adaptation for 
+Causal Inference Pipelines" by Omar El Quammah.
 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
+PERMITTED:
+- Viewing and running the code to verify reported results
+- Citing this repository in academic work (with attribution)
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+NOT PERMITTED without explicit written permission from the author:
+- Using this code or its methodology in academic publications
+- Commercial use of any kind
+- Integration into products or services
+- Modification and redistribution
+- Training machine learning models using this codebase
+
+The author retains all intellectual property rights and intends 
+to commercialise this architecture. Any unauthorised commercial 
+use will be pursued legally.
+
+For collaboration, licensing, or permission requests:
+Contact: Omar El Quammah — [your email]
+
+All rights reserved. No warranty expressed or implied.
