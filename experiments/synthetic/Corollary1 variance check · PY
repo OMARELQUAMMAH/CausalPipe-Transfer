@@ -1,0 +1,165 @@
+# -*- coding: utf-8 -*-
+# Omar El Quammah — Nanjing University of Information Science & Technology, 2026
+"""
+CausalPipe-Transfer: Corollary 1 Empirical Variance-Advantage Check
+======================================================================
+Reproduces the empirical confirmation reported under Corollary 1
+(Section 3.5 of the manuscript):
+
+  - Under COVARIATE shift: Full-Adapt variance is ~10.1x larger than
+    Component-Aware (sigma^2 = 0.1102 vs 0.0109).
+  - Under LABEL shift: the variance difference is negligible
+    (sigma^2 = 0.0009 vs 0.0009), because under label shift Component-
+    Aware retrains the outcome model f identically to Full-Adapt.
+
+Reuses the same generate_stream() and aipw() functions as
+causalpipe_synthetic_extended.py (same seeds, same model specs, same
+N_EVENTS/SHIFT_POINT), computes the SIGNED ATE estimate tau_hat (not
+absolute error) for both Full-Adapt and Component-Aware across 50
+seeds, and reports the actual variance of tau_hat under both shift
+types — the exact quantity Corollary 1 claims.
+
+Component-Aware routing (per the manuscript's own Case definitions):
+  - Covariate shift invalidates the propensity model g but leaves the
+    outcome model f intact -> CA retrains ONLY the propensity model,
+    reuses the SOURCE outcome model.
+  - Label shift invalidates the outcome model f but leaves g intact ->
+    CA retrains ONLY the outcome model, reuses the SOURCE propensity
+    model. (This is why CA and Full-Adapt are expected to be near-
+    identical under label shift: Full-Adapt retrains both, but the
+    propensity model doesn't actually change, so refitting it changes
+    little.)
+
+Output (to OUT_DIR):
+  corollary1_variance_check_results.txt
+"""
+
+import os
+import numpy as np
+from sklearn.linear_model import LogisticRegression, Ridge
+import warnings
+warnings.filterwarnings('ignore')
+
+OUT_DIR = os.path.join('results')
+os.makedirs(OUT_DIR, exist_ok=True)
+
+TRUE_ATE    = 5.0
+N_EVENTS    = 5000
+SHIFT_POINT = 2000
+N_FEATURES  = 5
+N_SEEDS     = 50
+
+
+def generate_stream(n, shift_type, shift_point, seed=42, gradual_window=500):
+    """Identical to causalpipe_synthetic_extended.py's generate_stream()."""
+    rng   = np.random.default_rng(seed)
+    alpha = rng.normal(0, 0.5, N_FEATURES)
+    beta  = np.ones(N_FEATURES) * 0.5
+    X_list, T_list, Y_list = [], [], []
+    for i in range(n):
+        w = 1.0 if i >= shift_point else 0.0
+        if shift_type in ('covariate_shift', 'mixed', 'gradual'):
+            mu = w * 4.0
+        else:
+            mu = 0.0
+        x = rng.normal(mu, 1.0, N_FEATURES)
+        logit = float(np.clip(x @ alpha, -6, 6))
+        prob  = 1 / (1 + np.exp(-logit))
+        t     = int(rng.random() < prob)
+        if shift_type == 'mechanism_shift' and i >= shift_point:
+            b = -beta
+        else:
+            b = beta
+        y_mean = TRUE_ATE * t + float(x @ b)
+        if shift_type in ('label_shift', 'mixed') and i >= shift_point:
+            y_mean += 10.0
+        y = y_mean + rng.normal(0, 1.0)
+        X_list.append(x); T_list.append(t); Y_list.append(y)
+    return (np.array(X_list, dtype=np.float64), np.array(T_list, dtype=np.int32),
+            np.array(Y_list, dtype=np.float64))
+
+
+def aipw(X, T, Y, pm=None, om=None):
+    """Identical to causalpipe_synthetic_extended.py's aipw()."""
+    n  = len(X)
+    XT = np.column_stack([X, T])
+    if pm is None:
+        pm = LogisticRegression(max_iter=1000, C=1.0, random_state=42).fit(X, T)
+    if om is None:
+        om = Ridge(alpha=1.0).fit(XT, Y)
+    e   = np.clip(pm.predict_proba(X)[:, 1], 0.05, 0.95)
+    XT1 = np.column_stack([X, np.ones(n)])
+    XT0 = np.column_stack([X, np.zeros(n)])
+    mu1, mu0 = om.predict(XT1), om.predict(XT0)
+    psi = mu1 - mu0 + T * (Y - mu1) / e - (1 - T) * (Y - mu0) / (1 - e)
+    ate = psi.mean()
+    return ate, pm, om
+
+
+def full_adapt_tau(X, T, Y, sp):
+    """Retrain BOTH propensity and outcome models on post-shift data."""
+    ate, _, _ = aipw(X[sp:], T[sp:], Y[sp:])
+    return ate
+
+
+def component_aware_tau(X, T, Y, sp, shift_type):
+    """Selectively retrain only the component the shift type invalidates."""
+    _, pm_src, om_src = aipw(X[:sp], T[:sp], Y[:sp])
+    Xp, Tp, Yp = X[sp:], T[sp:], Y[sp:]
+    if shift_type == 'covariate_shift':
+        pm_new = LogisticRegression(max_iter=1000, C=1.0, random_state=42).fit(Xp, Tp)
+        ate, _, _ = aipw(Xp, Tp, Yp, pm=pm_new, om=om_src)
+    elif shift_type == 'label_shift':
+        om_new = Ridge(alpha=1.0).fit(np.column_stack([Xp, Tp]), Yp)
+        ate, _, _ = aipw(Xp, Tp, Yp, pm=pm_src, om=om_new)
+    else:
+        raise ValueError(shift_type)
+    return ate
+
+
+def main():
+    lines = []
+    def log(s=""):
+        print(s); lines.append(s)
+
+    log("=" * 78)
+    log("COROLLARY 1 VARIANCE-ADVANTAGE VERIFICATION")
+    log(f"{N_SEEDS} seeds per shift type | claimed: covariate ~10.1x "
+        "(0.1102 vs 0.0109), label negligible (0.0009 vs 0.0009)")
+    log("=" * 78)
+
+    for shift_type in ['covariate_shift', 'label_shift']:
+        fa_taus, ca_taus = [], []
+        print(f"\nRunning {shift_type}...")
+        for seed in range(N_SEEDS):
+            X, T, Y = generate_stream(N_EVENTS, shift_type, SHIFT_POINT, seed=seed)
+            fa_taus.append(full_adapt_tau(X, T, Y, SHIFT_POINT))
+            ca_taus.append(component_aware_tau(X, T, Y, SHIFT_POINT, shift_type))
+
+        fa_taus, ca_taus = np.array(fa_taus), np.array(ca_taus)
+        fa_var, ca_var = fa_taus.var(ddof=1), ca_taus.var(ddof=1)
+        ratio = fa_var / ca_var if ca_var > 1e-12 else float('inf')
+
+        log("")
+        log("-" * 78)
+        log(f"SHIFT TYPE: {shift_type}")
+        log("-" * 78)
+        log(f"  Full-Adapt      tau_hat: mean={fa_taus.mean():.4f}  var={fa_var:.6f}  "
+            f"SD={fa_taus.std(ddof=1):.4f}")
+        log(f"  Component-Aware tau_hat: mean={ca_taus.mean():.4f}  var={ca_var:.6f}  "
+            f"SD={ca_taus.std(ddof=1):.4f}")
+        log(f"  Variance ratio (FA/CA): {ratio:.2f}x")
+
+    log("\n" + "=" * 78)
+    log("Compare the two 'Variance ratio' lines above against the manuscript's")
+    log("claimed ~10.1x (covariate shift) and ~1.0x/negligible (label shift).")
+    log("=" * 78)
+
+    path = os.path.join(OUT_DIR, 'corollary1_variance_check_results.txt')
+    with open(path, 'w', encoding='utf-8') as f:
+        f.write("\n".join(lines))
+    print(f"\nSaved: {path}")
+
+
+if __name__ == "__main__":
+    main()
