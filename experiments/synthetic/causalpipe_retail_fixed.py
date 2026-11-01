@@ -1,114 +1,129 @@
 # -*- coding: utf-8 -*-
-# Omar El Quammah — Nanjing University of Information Science & Technology, 2026
 """
-CausalPipe-Transfer: Retail Analysis (FreshRetailNet-50K) — TWO-PART MODEL
-============================================================================
-REVISION NOTE (replaces the previous single continuous-treatment DR model):
-
-  1. Discount field correction. The raw `discount` column is defined by the
-     dataset as 1.0 = full price / 0.9 = 10% off — i.e. it is the INVERSE
-     of a discount rate, not the discount rate itself. The corrected
-     treatment variable used throughout is:
-         true_discount = 1 - discount
-     (Previous versions of this script fed the raw `discount` column
-     directly into the estimator, which reversed the sign of the
-     headline causal conclusion.)
-
-  2. Discrete bins dropped entirely. `true_discount` has a massive point
-     mass at 0 (most transactions are sold at full price). Feeding this
-     directly into a single continuous-treatment DR estimator, or binning
-     it into discrete discount levels, produces numerically unstable
-     estimates (near-zero treatment variance within bins near the mass
-     point produced swings as large as -100%/+4668% in earlier runs).
-     Discrete bins are no longer used anywhere in this script.
-
-  3. TWO-PART MODEL (the standard fix for a treatment with a point mass
-     at zero):
-       Part A — Extensive margin: binary AIPW estimate of "any discount"
-                (true_discount > 0) vs "no discount" (true_discount == 0),
-                using the same AIPW estimator verified on the synthetic
-                benchmark.
-       Part B — Intensive margin: a smooth B-spline (degree=3, 6 knots)
-                dose-response curve for discount DEPTH, fit only on the
-                discounted subsample (true_discount > 0), evaluated over
-                the 1st-99th percentile of the observed range (no
-                extrapolation into near-empty regions).
-       Part C — Permutation placebo test on the discounted subsample.
-       Part D — Headline summary effect: moving true_discount from its
-                5th to 95th percentile WITHIN the discounted subsample,
-                read directly off the spline curve, with bootstrap CI.
-
-Outputs (to OUT_DIR):
-  retail_results.txt
-  retail_figures.png
+retail_final_two_part_spline_nozero_v2.py  (KBS R2 correction, 27 Oct 2026)
+Version 2 = the FINAL retail script with zero-price rows dropped (the only change to the method),
+plus two REPORT-ONLY additions needed for the revised text:
+  PART 0  naive (unadjusted) comparison of discounted vs non-discounted rows, recomputed on the corrected sample
+  PART 5  sensitivity: the same spline with product fixed effects (within-product), same bootstrap
+          (check value from an independent re-run: about -4.1% for the 5th->95th contrast)
+Run:  python retail_final_two_part_spline_nozero_v2.py     (about 15-30 min)
+Output: results/retail_FINAL_two_part_spline_results_NOZERO.txt (run from the repository root; data path below)
+ 
+CausalPipe-Transfer: FINAL two-part retail model (binary AIPW + spline
+dose-response), replacing the quadratic curve and dropping discrete bins
+entirely (Reviewer 1, points 12 and 13).
+ 
+This is the proposed FINAL specification for the retail section:
+ 
+  Part 1: Binary AIPW -- "any discount" (true_discount > 0) vs "no
+          discount" (true_discount == 0). Same AIPW estimator already
+          verified for the synthetic benchmark. (Before the R2 correction this gave +19.7% [19.2%, 20.2%];
+          zero-price rows are now dropped.)
+ 
+  Part 2: Smooth SPLINE dose-response curve (B-spline, degree=3, 6 knots --
+          same specification as retail_subbin_spline.py, which is the
+          reviewer's own explicit suggestion: "fit the spline you
+          recommend yourselves"), fit ONCE on the full discounted
+          subsample (true_discount > 0; n = 165,984 after dropping zero-price rows), evaluated at 11
+          points spanning the 1st-99th percentile of the observed range
+          (no extrapolation into near-empty regions). NO discrete bins --
+          bins on a continuous treatment are demonstrably unstable here
+          (confirmed twice now: the original 90-95% sub-segment
+          sensitivity, and the -100%/+4668%/+1489% blowups in the last
+          run), so the smooth curve is the only reported dose-response
+          shape.
+ 
+  Part 3: Permutation placebo test on the discounted subsample (unchanged
+          from the prior run, reproduced here for completeness).
+ 
+  Part 4: Summary effect -- moving true_discount from its 5th to 95th
+          percentile WITHIN the discounted subsample, read directly off
+          the spline curve, with bootstrap CI. This is the single
+          headline number for "how much does discount depth matter,
+          among items that are discounted at all."
+ 
+Edit RETAIL_PATH below if needed.
 """
-
+ 
 import os
 import numpy as np
 import pandas as pd
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
 from sklearn.linear_model import LinearRegression, LogisticRegression, Ridge
 from sklearn.preprocessing import StandardScaler, SplineTransformer
 import warnings
 warnings.filterwarnings('ignore')
-
-RETAIL_PATH = os.path.join('data', 'retail', 'eval_split FreshRetailNet-50K.xlsx')
-OUT_DIR     = os.path.join('results')
+ 
+RETAIL_PATH = os.path.join("data", "retail", "eval_split FreshRetailNet-50K.xlsx")
+OUT_DIR = "results"
 os.makedirs(OUT_DIR, exist_ok=True)
-
+OUT_FILE = os.path.join(OUT_DIR, "retail_FINAL_two_part_spline_results_NOZERO.txt")
 N_BOOTSTRAP = 300
-N_PLACEBO   = 200
-N_KNOTS     = 6
-SEED        = 42
-
-plt.rcParams.update({
-    'font.size': 11, 'axes.titlesize': 13, 'axes.labelsize': 12,
-    'figure.dpi': 150, 'savefig.dpi': 300, 'savefig.bbox': 'tight'
-})
-
+N_PLACEBO = 200
+N_KNOTS = 6
+SEED = 42
+ 
+print("Loading FreshRetailNet dataset...")
+df = pd.read_excel(RETAIL_PATH)
+df = df[df['sale_amount'] > 0].copy()
+print(f"  Non-zero transactions: {len(df):,}")
+ 
+# ── ONLY CHANGE vs the previous FINAL script (KBS R1 correction) ──────────
+# Drop rows whose recorded price ratio is exactly 0 (discount == 0). The
+# price ratio 0 is a data error, not a 100% discount: before this change
+# those rows were coded W = 1 - 0 = 1 (a "complete discount"). Thesis
+# Chapters 3 and 4 already drop them. Rows with a missing discount value are
+# kept, exactly as before. Nothing else in the method is changed.
+n_before_drop = len(df)
+df = df[df['discount'] != 0].copy()
+n_zero_price = n_before_drop - len(df)
+print(f"  Dropped zero-price rows (discount == 0): {n_zero_price:,}  "
+      f"(expected 1,300) -> {len(df):,} rows remain (expected 334,137)")
+ 
 FEATURE_COLS = ['stock_hour6_22_cnt', 'precpt', 'avg_temperature',
-                 'avg_humidity', 'avg_wind_level', 'holiday_flag', 'activity_flag']
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 1.  LOAD & PREPARE
-# ─────────────────────────────────────────────────────────────────────────────
-
-def load_retail(path):
-    print("Loading FreshRetailNet dataset...")
-    df = pd.read_excel(path)
-    df = df[df['sale_amount'] > 0].copy()
-    print(f"  Non-zero transactions: {len(df):,}")
-
-    feature_cols = [c for c in FEATURE_COLS if c in df.columns]
-    for col in feature_cols:
-        df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
-
-    Y = np.log1p(df['sale_amount'].values.astype(float))
-    X_raw = df[feature_cols].values.astype(float)
-    X = StandardScaler().fit_transform(X_raw)
-
-    # Discount-field correction (Reviewer 1, point 12): raw `discount` is
-    # 1.0=full price / 0.9=10% off, i.e. the inverse of a discount rate.
-    W_true = 1.0 - df['discount'].values.astype(float)
-    T = (W_true > 1e-9).astype(int)
-
-    print(f"  Features used   : {feature_cols}")
-    print(f"  true_discount   : mean={W_true.mean():.2%}  "
-          f"range=[{W_true.min():.2f}, {W_true.max():.2f}]")
-    print(f"  Discounted (T=1): {T.sum():,}   No discount (T=0): {(1 - T).sum():,}")
-    return X, W_true, T, Y, feature_cols
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 2.  PART A — EXTENSIVE MARGIN: BINARY AIPW
-# ─────────────────────────────────────────────────────────────────────────────
-
+                'avg_humidity', 'avg_wind_level', 'holiday_flag', 'activity_flag']
+FEATURE_COLS = [c for c in FEATURE_COLS if c in df.columns]
+for col in FEATURE_COLS:
+    df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
+ 
+Y_all = np.log1p(df['sale_amount'].values.astype(float))
+X_raw_all = df[FEATURE_COLS].values.astype(float)
+X_all = StandardScaler().fit_transform(X_raw_all)
+W_true_all = 1.0 - df['discount'].values.astype(float)
+rng = np.random.default_rng(SEED)
+ 
+T_all = (W_true_all > 1e-9).astype(int)
+PROD_all = pd.factorize(df['product_id'])[0] if 'product_id' in df.columns else None
+n_treated, n_control = T_all.sum(), (1 - T_all).sum()
+ 
+lines = []
+lines.append("=" * 78)
+lines.append("FINAL RETAIL MODEL: binary AIPW + spline dose-response (no discrete bins)")
+lines.append(f"zero-price rows dropped (discount == 0): {n_zero_price:,}")
+lines.append(f"n = {len(Y_all):,} total | discounted = {n_treated:,} | "
+             f"no discount = {n_control:,}")
+lines.append("=" * 78)
+print(f"\nDiscounted: {n_treated:,}  |  No discount: {n_control:,}")
+ 
+# ─────────────────────────────────────────────────────────────────────────
+# PART 0: Naive (unadjusted) comparison -- REPORT ONLY (for the "naive vs adjusted" sentence)
+# ─────────────────────────────────────────────────────────────────────────
+lines.append("\nPART 0: Naive (unadjusted) comparison, discounted vs no discount")
+lines.append("-" * 78)
+sa = df['sale_amount'].values.astype(float)
+naive_log = Y_all[T_all == 1].mean() - Y_all[T_all == 0].mean()
+for r in (f"  Mean sale amount: discounted {sa[T_all == 1].mean():.4f}  vs  no discount {sa[T_all == 0].mean():.4f}",
+          f"  Naive difference on the log scale: {naive_log:+.4f}  = {(np.exp(naive_log) - 1) * 100:+.1f}%"):
+    print(r); lines.append(r)
+ 
+# ─────────────────────────────────────────────────────────────────────────
+# PART 1: Binary AIPW (reproduced for a self-contained final script)
+# ─────────────────────────────────────────────────────────────────────────
+lines.append("\nPART 1: Binary AIPW -- any discount vs none")
+lines.append("-" * 78)
+print("\nPart 1: binary AIPW...")
+ 
+ 
 def aipw_binary(X, T, Y):
-    """AIPW DR estimator for a binary treatment (identical formula to the
-    synthetic-benchmark / sepsis scripts)."""
     n = len(X)
     XT = np.column_stack([X, T])
     pm = LogisticRegression(max_iter=2000, C=1.0, random_state=42).fit(X, T)
@@ -118,16 +133,36 @@ def aipw_binary(X, T, Y):
     XT0 = np.column_stack([X, np.zeros(n)])
     mu1, mu0 = om.predict(XT1), om.predict(XT0)
     psi = mu1 - mu0 + T * (Y - mu1) / e - (1 - T) * (Y - mu0) / (1 - e)
-    return psi.mean(), psi.std(ddof=1) / np.sqrt(n), psi
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 3.  PART B — INTENSIVE MARGIN: SPLINE DOSE-RESPONSE (discounted subsample)
-# ─────────────────────────────────────────────────────────────────────────────
-
+    return psi.mean(), psi.std(ddof=1) / np.sqrt(n)
+ 
+ 
+ate_bin, se_bin = aipw_binary(X_all, T_all, Y_all)
+ate_bin_pct = (np.exp(ate_bin) - 1) * 100
+ci_lo_log, ci_hi_log = ate_bin - 1.96 * se_bin, ate_bin + 1.96 * se_bin
+ci_lo_pct, ci_hi_pct = (np.exp(ci_lo_log) - 1) * 100, (np.exp(ci_hi_log) - 1) * 100
+row = f"  ATE = {ate_bin_pct:+.1f}%  95% CI=[{ci_lo_pct:.1f}%, {ci_hi_pct:.1f}%]"
+print(row); lines.append(row)
+ 
+# ─────────────────────────────────────────────────────────────────────────
+# PART 2: Spline dose-response, discounted subsample only, no bins
+# ─────────────────────────────────────────────────────────────────────────
+mask_disc = T_all == 1
+X, Y, W = X_all[mask_disc], Y_all[mask_disc], W_true_all[mask_disc]
+print(f"\nPart 2: spline dose-response, discounted subsample n={len(Y):,}")
+lines.append(f"\nPART 2: Spline dose-response (discounted subsample, n={len(Y):,})")
+lines.append("-" * 78)
+lines.append(f"  Observed true_discount range: [{W.min():.4f}, {W.max():.4f}], "
+             f"mean={W.mean():.4f}, median={np.median(W):.4f}")
+print(lines[-1])
+ 
+p1, p99 = np.percentile(W, [1, 99])
+eval_points = np.linspace(p1, p99, 11)
+lines.append(f"  Evaluating curve over [{p1:.4f}, {p99:.4f}] (1st-99th percentile, "
+             "no extrapolation)")
+print(lines[-1])
+ 
+ 
 def spline_curve(X, W, Y, eval_pts, n_knots=N_KNOTS):
-    """Partially-linear DR with a B-spline basis for the continuous
-    treatment W (true_discount), residualized against X."""
     om = LinearRegression().fit(X, Y)
     Y_res = Y - om.predict(X)
     spl = SplineTransformer(n_knots=n_knots, degree=3, include_bias=False)
@@ -139,218 +174,171 @@ def spline_curve(X, W, Y, eval_pts, n_knots=N_KNOTS):
     coef, *_ = np.linalg.lstsq(B_res, Y_res, rcond=None)
     B_eval = spl.transform(eval_pts.reshape(-1, 1))
     B_eval_centered = B_eval - B.mean(axis=0, keepdims=True)
-    return B_eval_centered @ coef
-
-
+    curve_log = B_eval_centered @ coef
+    return curve_log
+ 
+ 
+curve_log = spline_curve(X, W, Y, eval_points)
+curve_pct = (np.exp(curve_log) - 1) * 100
+ 
+boot_curves = []
+n_total = len(W)
+for _ in range(N_BOOTSTRAP):
+    idx = rng.integers(0, n_total, size=n_total)
+    try:
+        c = spline_curve(X[idx], W[idx], Y[idx], eval_points)
+        if np.all(np.isfinite(c)):
+            boot_curves.append(c)
+    except Exception:
+        pass
+boot_curves = np.array(boot_curves)
+ci_lo_curve = np.percentile(boot_curves, 2.5, axis=0)
+ci_hi_curve = np.percentile(boot_curves, 97.5, axis=0)
+ 
+lines.append(f"\n  {'true_discount':>14} {'Effect (rel. to mean)':>22} {'95% CI':>26}")
+for i, w in enumerate(eval_points):
+    lo_p = (np.exp(ci_lo_curve[i]) - 1) * 100
+    hi_p = (np.exp(ci_hi_curve[i]) - 1) * 100
+    row = f"  {w:>14.4f} {curve_pct[i]:>20.1f}%   [{lo_p:.1f}%, {hi_p:.1f}%]"
+    print(row); lines.append(row)
+ 
+# ─────────────────────────────────────────────────────────────────────────
+# PART 3: Placebo test, discounted subsample (reproduced for completeness)
+# ─────────────────────────────────────────────────────────────────────────
+lines.append(f"\nPART 3: Permutation placebo test ({N_PLACEBO} shuffles), discounted "
+             "subsample")
+lines.append("-" * 78)
+print(f"\nPart 3: placebo test ({N_PLACEBO} shuffles)...")
+ 
+ 
 def dr_estimate_linear(X, W, Y):
     om = LinearRegression().fit(X, Y)
     tm = LinearRegression().fit(X, W)
     Y_res = Y - om.predict(X)
     W_res = W - tm.predict(X)
     return (W_res * Y_res).mean() / (W_res ** 2).mean()
-
-
+ 
+ 
+real_ate = dr_estimate_linear(X, W, Y)
+placebo_ates = []
+for _ in range(N_PLACEBO):
+    W_shuffled = rng.permutation(W)
+    try:
+        a = dr_estimate_linear(X, W_shuffled, Y)
+        if np.isfinite(a):
+            placebo_ates.append(a)
+    except Exception:
+        pass
+placebo_ates = np.array(placebo_ates)
+placebo_mean, placebo_sd = placebo_ates.mean(), placebo_ates.std()
+p_value = (np.sum(np.abs(placebo_ates) >= np.abs(real_ate)) + 1) / (len(placebo_ates) + 1)
+row1 = f"  Real ATE (log scale, linear-in-W on discounted subsample): {real_ate:+.4f}"
+row2 = f"  Placebo null: mean={placebo_mean:+.4f}, SD={placebo_sd:.4f}"
+row3 = f"  Permutation p-value: {p_value:.4f}"
+for r in (row1, row2, row3):
+    print(r); lines.append(r)
+ 
+# ─────────────────────────────────────────────────────────────────────────
+# PART 4: Headline summary -- 5th to 95th percentile, read off the spline
+# ─────────────────────────────────────────────────────────────────────────
+lines.append("\nPART 4: Headline summary -- effect of discount DEPTH, 5th to 95th "
+             "percentile (within discounted items)")
+lines.append("-" * 78)
+print("\nPart 4: 5th-95th percentile summary effect...")
+ 
+p5, p95 = np.percentile(W, [5, 95])
+ 
+ 
 def delta_p5_p95(Xb, Wb, Yb):
     lo_w, hi_w = np.percentile(Wb, [5, 95])
     c = spline_curve(Xb, Wb, Yb, np.array([lo_w, hi_w]))
     return c[1] - c[0]
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 4.  FIGURES
-# ─────────────────────────────────────────────────────────────────────────────
-
-def make_figures(eval_points, curve_pct, ci_lo_curve, ci_hi_curve,
-                  placebo_ates, real_ate, ate_bin_pct, ci_lo_pct, ci_hi_pct,
-                  delta_pct, d_lo_pct, d_hi_pct, out_dir):
-
-    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-
-    # A — Extensive margin: any discount vs none
-    ax = axes[0, 0]
-    ax.bar(['No discount\n(reference)', 'Any discount'],
-           [0, ate_bin_pct],
-           yerr=[0, (ci_hi_pct - ci_lo_pct) / 2],
-           capsize=10, color=['#95A5A6', '#27AE60'], alpha=0.85,
-           edgecolor='black', lw=1.2)
-    ax.axhline(0, color='black', lw=1, alpha=0.4)
-    ax.set_ylabel('Effect on log(1+sale) (%)')
-    ax.set_title(f'(a) Extensive Margin: Any Discount vs None\n'
-                 f'ATE={ate_bin_pct:+.1f}%  95% CI=[{ci_lo_pct:.1f}%, {ci_hi_pct:.1f}%]',
-                 fontweight='bold')
-
-    # B — Spline dose-response curve on discounted subsample
-    ax = axes[0, 1]
-    ax.plot(eval_points, curve_pct, color='#2E86AB', lw=2.5, marker='o')
-    ax.fill_between(eval_points,
-                     (np.exp(ci_lo_curve) - 1) * 100,
-                     (np.exp(ci_hi_curve) - 1) * 100,
-                     alpha=0.2, color='#2E86AB')
-    ax.axhline(0, color='black', lw=1, alpha=0.4)
-    ax.set_xlabel('true_discount (1 - discount)')
-    ax.set_ylabel('Effect on log(1+sale) (%, rel. to mean)')
-    ax.set_title('(b) Intensive Margin: Spline Dose-Response\n'
-                 '(discounted subsample only, no discrete bins)', fontweight='bold')
-
-    # C — Placebo test (discounted subsample, linear-in-W)
-    ax = axes[1, 0]
-    ax.hist(placebo_ates, bins=40, color='#95A5A6', alpha=0.8,
-            edgecolor='black', lw=0.5, density=True, label='Placebo (shuffled W)')
-    ax.axvline(real_ate, color='#E74C3C', lw=2.5, linestyle='--',
-               label=f'Real ATE = {real_ate:.4f}')
-    ax.axvline(0, color='black', lw=1, alpha=0.4)
-    ax.set_xlabel('DR ATE (log scale, linear-in-W)')
-    ax.set_ylabel('Density')
-    ax.set_title('(c) Permutation Placebo Test\n(discounted subsample)', fontweight='bold')
-    ax.legend(fontsize=9)
-
-    # D — Headline summary: 5th to 95th percentile of discount depth
-    ax = axes[1, 1]
-    ax.bar(['Discount depth\n5th -> 95th pctile'], [delta_pct],
-           yerr=[(d_hi_pct - d_lo_pct) / 2], capsize=10,
-           color='#8E44AD', alpha=0.85, edgecolor='black', lw=1.2)
-    ax.axhline(0, color='black', lw=1, alpha=0.4)
-    ax.set_ylabel('Effect (%)')
-    ax.set_title(f'(d) Headline: Discount-Depth Effect\n'
-                 f'{delta_pct:+.1f}%  95% CI=[{d_lo_pct:.1f}%, {d_hi_pct:.1f}%]',
-                 fontweight='bold')
-
-    plt.suptitle('CausalPipe-Transfer: Retail Two-Part Model (Extensive + Intensive Margin)',
-                 fontweight='bold', fontsize=14, y=1.01)
-    plt.tight_layout()
-    path = os.path.join(out_dir, 'retail_figures.png')
-    plt.savefig(path)
-    print(f"\nFigure saved: {path}")
-    plt.close()
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 5.  MAIN
-# ─────────────────────────────────────────────────────────────────────────────
-
-def main():
-    print("=" * 70)
-    print("CAUSALPIPE-TRANSFER: RETAIL TWO-PART MODEL")
-    print("=" * 70)
-
-    rng = np.random.default_rng(SEED)
-    X_all, W_true_all, T_all, Y_all, feature_cols = load_retail(RETAIL_PATH)
-
-    lines = []
-    lines.append("=" * 78)
-    lines.append("RETAIL TWO-PART MODEL: binary AIPW + spline dose-response (no discrete bins)")
-    lines.append(f"n = {len(Y_all):,} total | discounted = {T_all.sum():,} | "
-                 f"no discount = {(1 - T_all).sum():,}")
-    lines.append("=" * 78)
-
-    # ── Part A: extensive margin ────────────────────────────────────────
-    print("\nPart A: binary AIPW (extensive margin)...")
-    ate_bin, se_bin, _ = aipw_binary(X_all, T_all, Y_all)
-    ate_bin_pct = (np.exp(ate_bin) - 1) * 100
-    ci_lo_log, ci_hi_log = ate_bin - 1.96 * se_bin, ate_bin + 1.96 * se_bin
-    ci_lo_pct, ci_hi_pct = (np.exp(ci_lo_log) - 1) * 100, (np.exp(ci_hi_log) - 1) * 100
-    lines.append("\nPART A: Extensive margin (any discount vs none)")
-    lines.append(f"  ATE = {ate_bin_pct:+.1f}%  95% CI=[{ci_lo_pct:.1f}%, {ci_hi_pct:.1f}%]")
-    print(lines[-1])
-
-    # ── Part B: intensive margin spline curve ───────────────────────────
-    mask_disc = T_all == 1
-    X, Y, W = X_all[mask_disc], Y_all[mask_disc], W_true_all[mask_disc]
-    print(f"\nPart B: spline dose-response (discounted subsample, n={len(Y):,})...")
-    p1, p99 = np.percentile(W, [1, 99])
-    eval_points = np.linspace(p1, p99, 11)
-    curve_log = spline_curve(X, W, Y, eval_points)
-    curve_pct = (np.exp(curve_log) - 1) * 100
-
-    boot_curves = []
-    for _ in range(N_BOOTSTRAP):
-        idx = rng.integers(0, len(W), size=len(W))
-        try:
-            c = spline_curve(X[idx], W[idx], Y[idx], eval_points)
-            if np.all(np.isfinite(c)):
-                boot_curves.append(c)
-        except Exception:
-            pass
-    boot_curves = np.array(boot_curves)
-    ci_lo_curve = np.percentile(boot_curves, 2.5, axis=0)
-    ci_hi_curve = np.percentile(boot_curves, 97.5, axis=0)
-
-    lines.append(f"\nPART B: Intensive margin (spline dose-response, n={len(Y):,})")
-    lines.append(f"  {'true_discount':>14} {'Effect (%)':>14} {'95% CI':>22}")
-    for i, w in enumerate(eval_points):
-        lo_p = (np.exp(ci_lo_curve[i]) - 1) * 100
-        hi_p = (np.exp(ci_hi_curve[i]) - 1) * 100
-        row = f"  {w:>14.4f} {curve_pct[i]:>13.1f}%   [{lo_p:.1f}%, {hi_p:.1f}%]"
-        print(row); lines.append(row)
-
-    # ── Part C: placebo test ─────────────────────────────────────────────
-    print(f"\nPart C: placebo test ({N_PLACEBO} shuffles)...")
-    real_ate = dr_estimate_linear(X, W, Y)
-    placebo_ates = []
-    for _ in range(N_PLACEBO):
-        W_shuffled = rng.permutation(W)
-        try:
-            a = dr_estimate_linear(X, W_shuffled, Y)
-            if np.isfinite(a):
-                placebo_ates.append(a)
-        except Exception:
-            pass
-    placebo_ates = np.array(placebo_ates)
-    p_value = (np.sum(np.abs(placebo_ates) >= np.abs(real_ate)) + 1) / (len(placebo_ates) + 1)
-    lines.append(f"\nPART C: Permutation placebo test ({N_PLACEBO} shuffles, discounted subsample)")
-    lines.append(f"  Real ATE (log, linear-in-W): {real_ate:+.4f}")
-    lines.append(f"  Placebo null: mean={placebo_ates.mean():+.4f}, SD={placebo_ates.std():.4f}")
-    lines.append(f"  Permutation p-value: {p_value:.4f}")
-    print(lines[-3]); print(lines[-2]); print(lines[-1])
-
-    # ── Part D: headline summary (5th -> 95th percentile) ────────────────
-    print("\nPart D: headline 5th-95th percentile summary...")
-    p5, p95 = np.percentile(W, [5, 95])
-    delta_log = delta_p5_p95(X, W, Y)
-    delta_pct = (np.exp(delta_log) - 1) * 100
-    boots_delta = []
+ 
+ 
+delta_log = delta_p5_p95(X, W, Y)
+delta_pct = (np.exp(delta_log) - 1) * 100
+ 
+boots_delta = []
+for _ in range(N_BOOTSTRAP):
+    idx = rng.integers(0, len(Y), size=len(Y))
+    try:
+        d = delta_p5_p95(X[idx], W[idx], Y[idx])
+        if np.isfinite(d):
+            boots_delta.append(d)
+    except Exception:
+        pass
+boots_delta = np.array(boots_delta)
+d_lo, d_hi = np.percentile(boots_delta, [2.5, 97.5])
+d_lo_pct, d_hi_pct = (np.exp(d_lo) - 1) * 100, (np.exp(d_hi) - 1) * 100
+ 
+row = f"  5th pct = {p5:.4f}, 95th pct = {p95:.4f}"
+print(row); lines.append(row)
+row = f"  Effect of moving from {p5:.4f} to {p95:.4f}: {delta_pct:+.1f}%  " \
+      f"95% CI=[{d_lo_pct:.1f}%, {d_hi_pct:.1f}%]"
+print(row); lines.append(row)
+ 
+# ─────────────────────────────────────────────────────────────────────────
+# PART 5: Sensitivity -- same spline with PRODUCT FIXED EFFECTS (REPORT ONLY)
+# Y, the covariates and the spline basis are demeaned within product before the same partialling-out
+# regression; same 5th->95th contrast, same row bootstrap (300 draws).
+# ─────────────────────────────────────────────────────────────────────────
+fe_txt = "  product_id not in the file: skipped"
+if PROD_all is not None:
+    lines.append("\nPART 5: Sensitivity -- spline with product fixed effects (discounted subsample)")
+    lines.append("-" * 78)
+    print("\nPart 5: spline with product fixed effects...")
+    g_all = pd.factorize(PROD_all[mask_disc])[0]
+ 
+    def demean(M, g):
+        G = g.max() + 1
+        M = M.reshape(len(M), -1).astype(float)
+        cnt = np.maximum(np.bincount(g, minlength=G), 1)
+        out = np.empty_like(M)
+        for j in range(M.shape[1]):
+            out[:, j] = M[:, j] - (np.bincount(g, weights=M[:, j], minlength=G) / cnt)[g]
+        return out
+ 
+    def delta_fe(Xb, Wb, Yb, gb):
+        lo_w, hi_w = np.percentile(Wb, [5, 95])
+        spl = SplineTransformer(n_knots=N_KNOTS, degree=3, include_bias=False)
+        B = spl.fit_transform(Wb.reshape(-1, 1))
+        Xd, Yd, Bd = demean(Xb, gb), demean(Yb, gb)[:, 0], demean(B, gb)
+        Y_res = Yd - LinearRegression().fit(Xd, Yd).predict(Xd)
+        B_res = np.column_stack([Bd[:, j] - LinearRegression().fit(Xd, Bd[:, j]).predict(Xd) for j in range(Bd.shape[1])])
+        coef, *_ = np.linalg.lstsq(B_res, Y_res, rcond=None)
+        Be = spl.transform(np.array([[lo_w], [hi_w]]))
+        return (Be[1] - Be[0]) @ coef
+ 
+    d_fe = delta_fe(X, W, Y, g_all)
+    bfe = []
     for _ in range(N_BOOTSTRAP):
         idx = rng.integers(0, len(Y), size=len(Y))
         try:
-            d = delta_p5_p95(X[idx], W[idx], Y[idx])
+            d = delta_fe(X[idx], W[idx], Y[idx], pd.factorize(g_all[idx])[0])
             if np.isfinite(d):
-                boots_delta.append(d)
+                bfe.append(d)
         except Exception:
             pass
-    boots_delta = np.array(boots_delta)
-    d_lo, d_hi = np.percentile(boots_delta, [2.5, 97.5])
-    d_lo_pct, d_hi_pct = (np.exp(d_lo) - 1) * 100, (np.exp(d_hi) - 1) * 100
-    lines.append(f"\nPART D: Headline summary (discount depth, 5th->95th percentile)")
-    lines.append(f"  5th pct = {p5:.4f}, 95th pct = {p95:.4f}")
-    lines.append(f"  Effect: {delta_pct:+.1f}%  95% CI=[{d_lo_pct:.1f}%, {d_hi_pct:.1f}%]")
-    print(lines[-2]); print(lines[-1])
-
-    lines.append("\n" + "=" * 78)
-    lines.append("SUMMARY OF FINAL NUMBERS FOR THE RETAIL SECTION")
-    lines.append("=" * 78)
-    lines.append(f"  1. Extensive margin (any discount vs none):  {ate_bin_pct:+.1f}% "
-                 f"[{ci_lo_pct:.1f}%, {ci_hi_pct:.1f}%]")
-    lines.append(f"  2. Intensive margin, 5th->95th pctile:       {delta_pct:+.1f}% "
-                 f"[{d_lo_pct:.1f}%, {d_hi_pct:.1f}%]  (among discounted items)")
-    lines.append(f"  3. Placebo p-value (discounted subsample):   {p_value:.4f}")
-
-    report = "\n".join(lines)
-    print(report[-500:])  # tail already printed incrementally above
-    out_path = os.path.join(OUT_DIR, 'retail_results.txt')
-    with open(out_path, 'w', encoding='utf-8') as f:
-        f.write(report)
-    print(f"\nResults saved: {out_path}")
-
-    make_figures(eval_points, curve_pct, ci_lo_curve, ci_hi_curve,
-                 placebo_ates, real_ate, ate_bin_pct, ci_lo_pct, ci_hi_pct,
-                 delta_pct, d_lo_pct, d_hi_pct, OUT_DIR)
-
-    return {
-        'ate_extensive_pct': ate_bin_pct, 'ci_extensive': (ci_lo_pct, ci_hi_pct),
-        'delta_intensive_pct': delta_pct, 'ci_intensive': (d_lo_pct, d_hi_pct),
-        'placebo_p_value': p_value,
-    }
-
-
-if __name__ == "__main__":
-    results = main()
+    fe_lo, fe_hi = np.percentile(bfe, [2.5, 97.5])
+    fe_txt = (f"  With product fixed effects, 5th->95th: {(np.exp(d_fe) - 1) * 100:+.1f}%  "
+              f"95% CI=[{(np.exp(fe_lo) - 1) * 100:.1f}%, {(np.exp(fe_hi) - 1) * 100:.1f}%]  "
+              f"({g_all.max() + 1} products; check value about -4.1%)")
+    print(fe_txt); lines.append(fe_txt)
+ 
+lines.append("\n" + "=" * 78)
+lines.append("SUMMARY OF FINAL NUMBERS FOR THE RETAIL SECTION")
+lines.append("=" * 78)
+lines.append(f"  1. Any discount vs none (binary AIPW):        {ate_bin_pct:+.1f}% "
+             f"[{ci_lo_pct:.1f}%, {ci_hi_pct:.1f}%]")
+lines.append(f"  2. Discount-depth effect, 5th->95th pctile:   {delta_pct:+.1f}% "
+             f"[{d_lo_pct:.1f}%, {d_hi_pct:.1f}%]  (among discounted items)")
+lines.append(f"  3. Placebo test p-value (discounted subsample): {p_value:.4f}")
+lines.append("  4. Full dose-response shape: see spline curve table above (Part 2)")
+lines.append(f"  5. Naive difference (log scale): {(np.exp(naive_log) - 1) * 100:+.1f}%  (Part 0)")
+lines.append("  6. Sensitivity, product fixed effects:" + fe_txt.split(":", 1)[-1])
+ 
+report = "\n".join(lines)
+with open(OUT_FILE, 'w', encoding='utf-8') as f:
+    f.write(report)
+print(f"\nSaved to: {OUT_FILE}")
+print("\nPASTE THE FULL CONSOLE OUTPUT back -- do not summarize it yourself.")
