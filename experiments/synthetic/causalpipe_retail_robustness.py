@@ -77,6 +77,10 @@ def load_retail(path):
     print("Loading FreshRetailNet dataset...")
     df = pd.read_excel(path)
     df = df[df['sale_amount'] > 0].copy()
+    # KBS revision 2: rows with discount == 0 (price ratio 0) are data errors and are dropped
+    n_zero_price = int((df['discount'] == 0).sum())
+    df = df[df['discount'] != 0].copy()
+    print(f"  Dropped zero-price rows (discount == 0): {n_zero_price:,}")
     print(f"  Non-zero transactions: {len(df):,}")
 
     feature_cols = [c for c in FEATURE_COLS if c in df.columns]
@@ -392,6 +396,7 @@ def main():
 
     df_raw = pd.read_excel(RETAIL_PATH)
     df_raw = df_raw[df_raw['sale_amount'] > 0].copy()
+    df_raw = df_raw[df_raw['discount'] != 0].copy()   # same exclusion as in load_retail()
     Y_raw = df_raw['sale_amount'].values.astype(float)
 
     X, W_true, T, Y_log, feat_cols = load_retail(RETAIL_PATH)
