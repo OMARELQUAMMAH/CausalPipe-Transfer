@@ -22,7 +22,7 @@ CausalPipe-Transfer/
 ├── requirements.txt
 ├── experiments/
 │   ├── synthetic/
-│   │   ├── synthetic_benchmark.py                  # Main synthetic benchmarks (five methods, five shift types)
+│   │   ├── synthetic_benchmark.py                  # Earlier 10-seed synthetic benchmark (does not reproduce Table 3)
 │   │   ├── corollary1_variance_check.py            # Empirical check of Corollary 1's variance-advantage claim
 │   │   ├── detection_error_small_sample_sweep.py   # Detection-error MSE and small-target-sample (n2) sweep
 │   │   └── gradual_shift_detector_accuracy.py      # Detector accuracy under gradual shift
@@ -63,6 +63,8 @@ No GPU is required. All experiments run on standard hardware (8 GB RAM is suffic
 ```
 python experiments/synthetic/synthetic_benchmark.py
 ```
+**Note:** `synthetic_benchmark.py` is an earlier 10-seed version of the synthetic benchmark (five methods). It does **not** reproduce Table 3 of the paper, which reports 50 seeds and six methods (including ADWIN). The script that produced Table 3 is not included in this repository.
+
 The number of seeds is set by `N_SEEDS` at the top of each script. Outputs are written to `results/`.
 
 **2. Retail analysis**
@@ -95,7 +97,7 @@ python experiments/synthetic/gradual_shift_detector_accuracy.py
 ## Key Results
 | Domain | N | Main result | 95% CI | Significant |
 |---|---|---|---|---|
-| Synthetic (avg) | 5,000 events per stream | 72.4% average MAE reduction (Component-Aware vs. Source-Only, paper Table 3) | not applicable | Yes |
+| Synthetic (avg) | 5,000 events per stream | 72.4% average MAE reduction (Component-Aware vs. Source-Only, paper Table 3; not reproduced by the scripts here) | not applicable | Yes |
 | Retail: extensive margin (any discount vs. none) | 334,137 | +15.6% | [15.2%, 16.1%] | Yes |
 | Retail: intensive margin (discount depth, spline dose-response) | 165,984 (discounted subsample) | −25.4% (5th to 95th percentile of discount depth, W 0.008 to 0.370) | [−26.7%, −24.9%] | Yes |
 | Sepsis (OWATE) | 20,324 | −3.18 pp (raw difference −7.21 pp; 55.8% attributable to confounding) | [−3.74 pp, −2.63 pp] | Yes |
@@ -125,7 +127,7 @@ The propensity-calibration shift detector uses two primary signals, a third mech
 - **Label shift:** a two-sided t-test on outcome residuals from the source model (α = 0.05), together with a mean shift larger than 2 residual standard deviations.
 - **Mechanism shift:** tested only if the first two signals do not fire; KS test on the residual distributions, with an explicit "otherwise → label_shift" fallback rule.
 
-Detection accuracy: 95.6% at target-window size n₂ = 3,000 (239/250 across the expanded shift-type × seed grid). A dedicated small-target-sample sweep (n₂ ∈ {500, 1000, 2000, 3000}) additionally shows the single-class-propensity fallback firing only at n₂ = 500 (3/50 covariate-shift windows, 3/50 mixed, 1/50 gradual; zero at n₂ ≥ 1000). See `detection_error_small_sample_sweep.py`.
+Detection accuracy: 95% (190 of 200 test cases), as reported in the paper. A dedicated small-target-sample sweep (n₂ ∈ {500, 1000, 2000, 3000}) additionally shows the single-class-propensity fallback firing only at n₂ = 500 (3/50 covariate-shift windows, 3/50 mixed, 1/50 gradual; zero at n₂ ≥ 1000). See `detection_error_small_sample_sweep.py`.
 
 ## Major Corrections in This Revision
 - **Retail: zero-price rows.** The retail sample contained 1,300 rows whose recorded price ratio is exactly 0. They had been coded as complete discounts (W = 1). They are data errors and are now dropped before any other step (334,137 transactions remain). All retail numbers were recomputed.
